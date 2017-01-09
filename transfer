@@ -1,0 +1,663 @@
+import React from "react";
+import {lib} from "altynCommonLibrary";
+
+// Localisation v2.0, part 1 of 2
+let translations = (
+//=include all.json
+);
+// End localisation v2.0, part 1 of 2
+
+
+import FormWrapper from "../../formComponents/dist/formWrapper";
+import LPLikeCurrencyAmount from "../../formComponents/dist/lplikeCurrencyAmount";
+import LPLikeSelect from "../../formComponents/dist/lplikeSelect";
+
+class ExternalMoveDetailForm extends React.Component {
+  constructor(props) {
+    super(props);
+
+    // Localisation v3.0
+    translations = this.props.taskNameTranslate || translations;
+    // End localisation v3.0
+
+    this.state = {
+      accountList: [],
+      paymentAccount: {currency: "KZT"},
+      currentPaymentCurrency: "KZT",
+      currencyList: [],
+      accountType: props.accountTypes[0],
+      isBlocked: false,
+      canSubmit: false,
+      beneficiaryNumber: '',
+      bik: "",
+      sum: 0,
+      listOperation: [],
+      currentOperation: {},
+      errors: {},
+      exchangeRate: 0,
+      convertedAmount: 0,
+      kbe: props.kbeList[0],
+      knp: props.knpList[0],
+      paymentPurpose: "",
+      equivalentKzt: 0,
+      transaction: {
+        total: {
+          commission: {
+            from: 0,
+            loading: false
+          },
+          from: {
+            amount: 0,
+            currency: "KZT",
+            loading: false
+          },
+          to: {
+            currency: "KZT"
+          }
+        }
+      },
+      beneficiaryIIN: "",
+      beneficiaryName: ""
+    };
+
+
+    // Localisation v2.0, part 2 of 2
+    this.translate = lib.getTranslatorWithAdditional(translations);
+    // End localisation v2.0, part 2 of 2
+  }
+
+  componentDidMount() {
+    let processTemplate = this.props.processTemplate || {},
+      {dataStore} = this.props.proxyServices;
+
+    dataStore.getAll(["currency", "accounts", "cards"], (response) => {
+      let currencyList = response["currency"]["currencyList"];
+      let accountList = response["accounts"];
+      let cards = response["cards"];
+
+      accountList = accountList.map(function (item) {
+        return {
+          'id': item['iban'],
+          type: 'item',
+          text: item['iban'] + ' (' + item['balance'] + ' ' + item['currAlfaCode'] + ')',
+          currency: item['currAlfaCode'],
+          balance: item['balance'],
+          payerType: 'account',
+          isBlocked: item.isBlocked
+        }
+      });
+      cards = cards.map(function (item) {
+        return {
+          'id': item['id'],
+          type: item['type'],
+          text: item['id'] + ' (' + item['balance'] + ' ' + item['currency'] + ')',
+          currency: item['currency'],
+          balance: item['balance'],
+          payerType: 'card'
+        }
+      });
+
+      let paymentList = accountList.concat(cards);
+
+      let paymentAccount = (processTemplate.paymentData)
+          ? paymentList.find(function(el) {
+            return (
+              el["payerType"] === processTemplate.paymentData["payerType"]
+              && el["id"] === processTemplate.paymentData["payerId"] );
+          }) || paymentList[0]
+          : paymentList[0],
+        foundCurrencyObj = (processTemplate.paymentData) // Helper variable
+          ? currencyList.find(function(curr) {
+            return (curr["id"] === processTemplate.paymentData["paymentCurrency"]);
+          })
+          : null,
+        currentCurrency = (foundCurrencyObj)
+          ? foundCurrencyObj["id"]
+          : paymentAccount["currency"];
+
+      if (processTemplate.beneficiaryIban) {
+        this.state.beneficiaryNumber = processTemplate.beneficiaryIban;
+
+        if (this.isAltynIban(processTemplate.beneficiaryIban)) {
+          this.state.bik = "ATYNKZKA"
+        }
+      }
+      if (processTemplate.paymentData) {
+        this.state.sum = processTemplate.paymentData["paymentSum"];
+      }
+
+      this.setState({
+        isBlocked: paymentAccount.isBlocked,
+        currencyList: currencyList,
+        accountList: paymentList,
+        paymentAccount,
+        currentPaymentCurrency: paymentList[0]['currency'],
+        currentCurrency
+      }, this.calculateTransaction());
+    })
+  }
+
+  calculateTransaction = () => {
+    let {dataStore} = this.props.proxyServices;
+    dataStore.calculateTransaction({
+      fromCurrency: this.state.paymentAccount.currency,
+      toAmount: this.state.sum,
+      toCurrency: this.state.currentPaymentCurrency,
+      commission: this.getCommissionCode(),
+      callback: (result) => {
+        this.setState({transaction: result}, this.calculateTransactionSwift);
+      },
+    });
+  }
+
+  calculateTransactionSwift = (sum) => {
+    let {dataStore} = this.props.proxyServices;
+    dataStore.exchange({
+      fromCurrency: 'KZT',
+      toAmount: this.state.sum,
+      toCurrency:  this.state.currentPaymentCurrency,
+      callback: (result) => {
+        this.setState({equivalentKzt: result}, this.checkValidation);
+      },
+    });
+  }
+
+  changeAccount = (current) => {
+    this.setState({
+      isBlocked: current.isBlocked,
+      paymentAccount: current,
+      currentPaymentCurrency: current['currency']
+    })
+  };
+
+  checkValidation = (callback = lib.noop) => {
+    let result = {},
+      canSubmit = true,
+      tests = {
+        swift: {
+          approve: this.checkValidationSwiftMoney(),
+          descr: this.translate("Сумма при перевода за рубеж более 3000 KZT")
+        },
+        sumMore: {
+          approve: (this.state.transaction.total.from.amount > this.state.paymentAccount['balance']),
+          descr: this.translate("Недостаточно средств на счете")
+        },
+        sum: {
+          approve: this.isFieldEmpty('sum'),
+          descr: this.translate("Укажите сумму")
+        },
+        beneficiaryNumber: {
+          approve: this.isFieldEmpty('beneficiaryNumber'),
+          descr: this.translate("Укажите IBAN или расчетный счет")
+        },
+        isBlocked: {
+          approve: this.state.isBlocked,
+          descr: this.translate("Данный счет недоступен для оплаты. Выберите другой счет")
+        }
+      };
+
+
+    for (let key in tests) {
+      if (tests[key]["approve"]) {
+        console.log('tests', key);
+        result[key] = tests[key]["descr"];
+        canSubmit = false;
+      }
+    }
+
+    this.setState({
+      canSubmit: canSubmit,
+      errors: result
+    }, callback)
+  }
+
+  isFieldEmpty = (field) => {
+    let res = true;
+
+    if (!this.state.hasOwnProperty(field)) {
+      console.warn('Check condition! No such field in the state.');
+    }
+    else {
+      res = !(this.state[field]);
+    }
+
+    return res;
+  }
+
+/*  checkValidation = () => {
+    let emptyFields = !!((this.state.sum === 0 || this.state.beneficiaryNumber === '')),
+      counterMoney = (this.state.transaction.total.from.amount > this.state.paymentAccount['balance']);
+    return (emptyFields || counterMoney)
+  };*/
+
+  checkValidationSwiftMoney = () => {
+    return (this.state.equivalentKzt < 3000 && this.state.accountType.id != "iban");
+  };
+
+  getCommissionCode = (iban = this.state.beneficiaryNumber, type = this.state.accountType.id) =>{
+    return (this.isAltynIban(iban))?("TRA01"):("TRA02");
+  }
+
+  isAltynIban = (iban = this.state.beneficiaryNumber, type = this.state.accountType.id) => {
+    return (type === "iban" && iban.substr(4, 3) === "949");
+  }
+
+  isNotAltynIban = (iban = this.state.beneficiaryNumber, type = this.state.accountType.id) => {
+    return (type === "iban" && iban.substr(4, 3) != "949" && iban.substr(0, 2) === "KZ");
+  }
+
+  checkIBAN = (iban) => {
+    let {dataStore} = this.props.proxyServices;
+
+    dataStore.getBankByIbanAccCode(iban.slice(4,7), (response) => {
+
+      let bankData = response;
+      console.log("bankData ", response);
+
+      if (bankData) {
+        this.setState({
+          bik: bankData.code
+        })
+      }
+    })
+  }
+
+  returnResult = () => {
+    let state = this.state,
+      finalData = {
+        "initData": {
+          "paymentData": {
+            "payerId": state.paymentAccount.id,
+            "payerType": state.paymentAccount.payerType,
+            "paymentCurrency" : state.currentPaymentCurrency,
+            "paymentSum": state.sum || 0, //state.transaction.total.from.amount || 0,
+            "paymentFee": state.transaction.total.commission.to || 0,
+          },
+          "beneficiaryIIN": state.beneficiaryIIN,
+          "beneficiaryName": state.beneficiaryName,
+          "bic": state.bik,
+          "beneficiaryIban": state.beneficiaryNumber
+        }
+      };
+    if (state.accountType.id === "iban") {
+      finalData["initData"]["beneficiaryIban"] = state.beneficiaryNumber;
+    }
+    else {
+      finalData["initData"]["beneficiaryAccountId"] = state.beneficiaryNumber;
+    }
+    if (this.isNotAltynIban()) {
+      finalData["initData"]["kbe"] = state.kbe["id"] || '',
+      finalData["initData"]["knp"] = state.knp["id"] || '',
+      finalData["initData"]["paymentPurpose"] = state.paymentPurpose
+    }
+
+    this.props.callbacks.onSubmit(finalData)
+  };
+
+  render() {
+    let {accountList, paymentAccount, paymentData, beneficiaryNumber, accountType,
+      bik, currencyList, currentPaymentCurrency, errors, sum, transaction,
+      kbe, knp, paymentPurpose, beneficiaryName, beneficiaryIIN} = this.state;
+
+    let {context, callbacks, accountTypes, kbeList, knpList} = this.props,
+      {formatNumber} = lib;
+
+      console.log("state", this.state);
+
+    return (
+
+      <FormWrapper
+        title = {this.translate("Исходящий платеж")}
+        subtitle = {this.translate("Введите реквизиты счета")}
+        subtitleSuccess = {false}
+        formStepsCurrent = {0}
+        formStepsTranslate = {this.translate}
+        formStepsSteps = {[
+          {text: this.translate("Ввод реквизитов")},
+          {text: this.translate("Swift")},
+          {text: this.translate("Подтверждение")},
+          {text: this.translate("Готово!")}
+        ]}
+        html = {
+          <div className="row">
+            <div className="col-lg-12">
+
+              <h3 className="subtitle-section">{this.translate('Счет отправителя')}</h3>
+
+              <div className="row">
+                <div className="col-sm-12 col-lg-4 text-right">
+                  <label>
+                    {this.translate("Выберите счет")}
+                  </label>
+                </div>
+
+                <div className="form-content col-sm-12 col-lg-8">
+                  <LPLikeSelect
+                    superItemList={accountList}
+                    currentItem={paymentAccount}
+                    filter={false}
+                    onChange={(newVal) => {
+                      this.setState({
+                        isBlocked: newVal.isBlocked,
+                        paymentAccount: newVal
+                      }, this.calculateTransaction);
+                    }} />
+
+                    {(this.state.errors.isBlocked)
+                      ? (<div className="clearfix col-lg-12">
+                        <span className="has-error-text">{this.state.errors.isBlocked}</span>
+                      </div>)
+                        : (null)}
+
+                    {(this.state.errors.sumMore)
+                      ? (<div className="clearfix col-lg-12">
+                        <span className="has-error-text">{this.state.errors.sumMore}</span>
+                      </div>)
+                        : (null)}
+                </div>
+              </div>
+
+              <h3 className="subtitle-section">{this.translate('Счет получателя')}</h3>
+
+              <div className="row">
+                <div className="col-sm-12 col-lg-4 text-right">
+                  <label>
+                    {this.translate('IBAN/Расчетный счет')}
+                  </label>
+                </div>
+
+                <div className="form-content col-sm-12 col-lg-5">
+                  <input type="text"
+                    className="form-control"
+                    value={beneficiaryNumber}
+                    onChange={(e) => {
+                      let beneficiaryNumber = e.target.value,
+                        newState = {
+                          beneficiaryNumber
+                        };
+
+                      if (this.isAltynIban(beneficiaryNumber)) {
+                        newState["bik"] = "ATYNKZKA";
+                      }
+
+                      if (beneficiaryNumber.length > 6) {
+                        this.checkIBAN(beneficiaryNumber)
+                      }
+
+                      let shouldRecalculate = (this.getCommissionCode(beneficiaryNumber) !== this.getCommissionCode(this.state.beneficiaryNumber));
+
+                      this.setState(
+                        newState,
+                        (shouldRecalculate)
+                          ? this.calculateTransaction
+                          : lib.noop);
+                    }} />
+                </div>
+
+                <div className="form-content col-sm-12 col-lg-3">
+                  <LPLikeSelect
+                    superItemList={accountTypes}
+                    currentItem={accountType}
+                    filter={false}
+                    onChange={(newVal) => {
+                      this.setState({
+                        accountType: newVal
+                      }, this.calculateTransaction)
+                    }} />
+                </div>
+                <div className="col-md-12 col-md-offset-0 col-lg-8 col-lg-offset-4">
+                  {(this.state.errors.beneficiaryNumber)?(
+                    <div className="clearfix col-lg-12">
+                      <span className="has-error-text">{this.state.errors.beneficiaryNumber}</span>
+                    </div>
+                  ):(null)}
+                </div>
+              </div>
+
+              <div className="row">
+                <div className="col-sm-12 col-lg-4 text-right">
+                  <label>
+                    {this.translate('БИК')}
+                  </label>
+                </div>
+
+                <div className="form-content col-sm-12 col-lg-8">
+
+                  <input type="text" className="form-control" value={bik}
+                    onChange={(e) => {
+                      this.setState({
+                        bik: e.target.value
+                      });
+                    }}
+                    disabled={this.isAltynIban()} />
+                </div>
+              </div>
+
+              {(this.isNotAltynIban())?( <hr className="form-separator" /> ):(null)}
+
+              {(this.isNotAltynIban())?(
+              <div className="form-module" role="application">
+
+                <div className="row">
+                  <div className="col-sm-12 col-lg-4 text-right">
+                    <label>
+                      {this.translate('ФИО получателя')}
+                    </label>
+                  </div>
+
+                  <div className="form-content col-sm-12 col-lg-8">
+                    <input type="text" className="form-control" value={beneficiaryName}
+                         onChange={(e) => {
+                      this.setState({
+                        beneficiaryName: e.target.value
+                      });
+                    }} />
+                  </div>
+                </div>
+
+                <div className="row">
+                  <div className="col-sm-12 col-lg-4 text-right">
+                    <label>
+                      {this.translate('ИНН')}
+                    </label>
+                  </div>
+
+                  <div className="form-content col-sm-12 col-lg-8">
+                    <input type="text" className="form-control" value={beneficiaryIIN}
+                         onChange={(e) => {
+                      this.setState({
+                        beneficiaryIIN: e.target.value
+                      });
+                    }} />
+                  </div>
+                </div>
+
+                <div className="row">
+                  <div className="col-sm-12 col-lg-4 text-right">
+                    <label>
+                      {this.translate('КБе')}
+                    </label>
+                  </div>
+
+                  <div className="form-content col-sm-12 col-lg-8">
+                    <LPLikeSelect
+                      superItemList={kbeList}
+                      currentItem={kbe}
+                      onChange={(newVal) => {
+                        this.setState({
+                          kbe: newVal
+                        });
+                      }} />
+                  </div>
+                </div>
+
+                <div className="row">
+                  <div className="col-sm-12 col-lg-4 text-right">
+                    <label>
+                      {this.translate('КНП')}
+                    </label>
+                  </div>
+
+                  <div className="form-content col-sm-12 col-lg-8">
+                    <LPLikeSelect
+                      superItemList={knpList}
+                      currentItem={knp}
+                      onChange={(newVal) => {
+                        this.setState({
+                          knp: newVal
+                        });
+                      }} />
+                  </div>
+                </div>
+
+                <div className="row">
+                  <div className="col-sm-12 col-lg-4 text-right">
+                    <label>
+                      {this.translate('Назначение платежа')}
+                    </label>
+                  </div>
+
+                  <div className="form-content col-sm-12 col-lg-8">
+                    <input type="text" className="form-control" value={paymentPurpose}
+                      onChange={(e) => {
+                        this.setState({
+                          paymentPurpose: e.target.value
+                        });
+                      }} />
+                  </div>
+                </div>
+              </div>
+              ):(null)}
+
+              <div className="row">
+                <div className="col-sm-12 col-lg-4 text-right">
+                  <label>
+                    {this.translate('Сумма перевода')}
+                  </label>
+                </div>
+
+                <div className="form-content col-sm-12 col-lg-8">
+
+                  <LPLikeCurrencyAmount
+                    className="transfer-amount"
+
+                    value={{
+                      currency: currentPaymentCurrency,
+                      amount: sum
+                    }}
+
+                    currencies={currencyList}
+
+                    translate={this.translate}
+
+                    onChange={(current) => {
+                      this.setState({
+                        sum: current.amount,
+                        currentPaymentCurrency: current.currency
+                      }, this.calculateTransaction)
+                    }} />
+
+                    {(this.state.errors.sum)
+                      ? (<div className="clearfix col-lg-12">
+                        <span className="has-error-text">{this.state.errors.sum}</span>
+                      </div>)
+                        : (null)}
+
+                    {(this.state.errors.swift)
+                      ? (<div className="clearfix col-lg-12">
+                        <span className="has-error-text">{this.state.errors.swift}</span>
+                      </div>)
+                        : (null)}
+                </div>
+              </div>
+
+              {(!this.isAltynIban())?( <hr className="form-separator" /> ):(null)}
+
+              {(this.state.paymentAccount["currency"] !== this.state.currentPaymentCurrency)?(
+                <div className="row">
+                  <div className="col-xs-4 col-lg-4 text-right">
+                    <label>
+                      {this.translate("Текущий курс:")}
+                    </label>
+                  </div>
+
+                  <div className="form-content col-xs-8 col-lg-8">
+                    <p className="form-text">
+                      <em>{`1 ${currentPaymentCurrency} = ${transaction.exchangeRate.rate} ${this.state.paymentAccount["currency"]}`}</em>
+                    </p>
+                  </div>
+                </div>
+              ):(null)}
+
+              {(!this.isAltynIban())?(
+                <div className="row">
+                  <div className="col-xs-4 col-lg-4 text-right">
+                    <label>
+                      {this.translate("Комиссия за перевод:")}
+                    </label>
+                  </div>
+
+                  <div className="form-content col-xs-8 col-lg-8">
+                    <p className="form-text" style={(transaction.total.commission.loading) ? {color: "gray"} : {}}>
+                      {`${lib.formatNumber(transaction.total.commission.from)} ${transaction.total.from.currency}`}
+                    </p>
+                  </div>
+                </div>
+              ):(null)}
+
+              <hr className="form-separator" />
+
+              <div className="row text-row">
+                <div className="col-xs-4 col-lg-4 text-right">
+                  <label className="transfer-amount-commission-label">
+                    {this.translate("Сумма списания со счета:")}
+                  </label>
+                </div>
+
+                <div className="form-content col-xs-8 col-lg-8">
+                  <p className="total-sum-text" style={(transaction.total.from.loading) ? {color: "gray"} : {}}>
+                    <strong>{`${lib.formatNumber(transaction.total.from.amount)} ${transaction.total.from.currency}`}</strong>
+                  </p>
+                </div>
+
+                {(!this.isAltynIban())?(  // TODO Refactor - show not on isAltynIban, but on transaction.total.commission. Same for other isAltynIban usages in code, except getting commission code.
+                  <em className="col-xs-4 col-lg-4 text-right italic">{this.translate("(с учетом комиссии)")}</em>
+                ):(null)}
+              </div>
+            </div>
+          </div>
+          }
+          buttonsSubmit = {
+            <button
+              type="button"
+              className="btn btn-footer-button-submit"
+              disabled={!this.state.canSubmit}
+              onClick={this.returnResult}>
+              {this.translate("Далее")}
+            </button>
+          }
+        />
+    );
+  }
+}
+
+ExternalMoveDetailForm.propTypes = {};
+ExternalMoveDetailForm.defaultProps = {
+  currencyOperationCodesList: [
+    {id: "800", text: "800 - Возврат ДС за переплату"},
+  ],
+  kbeList: [
+    {id: "19", text: "19 - Резидент - Домашние хозяйства"},
+  ],
+  knpList: [
+    {id: "119", text: "119 - Материальная помощь"},
+  ],
+  accountTypes: [
+    {id: "iban", text: "IBAN"},
+    {id: "accId", text: "Р/с"}
+  ]
+};
+
+export default ExternalMoveDetailForm;
+
+// "beneficiaryCurrency": state.currentPaymentCurrency,
